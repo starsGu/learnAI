@@ -18,7 +18,9 @@ from datasets.layout import DEFAULT_DATA_ROOT, configure_train_paths
 from datasets.tokenizer import ensure_tokenizer
 from .checkpoint import load_training_checkpoint, save_checkpoint
 from .common import (
+    amp_context,
     build_model,
+    build_optimizer,
     choose_device,
     distributed_environment,
     read_json,
@@ -54,8 +56,7 @@ def evaluate_loss(model, corpus, config, device, rank, world_size) -> float:
     for index in range(batches):
         offset = index * batch_size * world_size
         tokens = corpus.batch(offset, batch_size, rank, world_size, VALIDATION_SEED, device)
-        autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
-        with autocast:
+        with amp_context(device):
             output = model(tokens, labels=tokens, return_logits=False)
         losses[0] += output.loss.double() * batch_size * sequence_length
         losses[1] += batch_size * sequence_length
@@ -79,22 +80,16 @@ def train(config: dict) -> dict:
     seed = int(config.get("seed", 42))
     seed_everything(seed + rank)
 
-    model = build_model(config["model_config"], device, config.get("dtype", "bfloat16"))
+    # master_weights=false：参数存 bf16 省显存，用 fp32 主权重副本保证更新精度
+    parameter_dtype = "bfloat16" if config.get("master_weights", True) is False else config.get("dtype", "bfloat16")
+    model = build_model(config["model_config"], device, parameter_dtype)
     if config.get("gradient_checkpointing", True):
         model.set_gradient_checkpointing(True)
     raw_model = model
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank] if device.type == "cuda" else None)
 
-    optimizer_kwargs = {
-        "lr": float(config["learning_rate"]),
-        "betas": tuple(config.get("betas", [0.9, 0.95])),
-        "eps": float(config.get("adam_epsilon", 1e-8)),
-        "weight_decay": float(config.get("weight_decay", 0.1)),
-    }
-    if device.type == "cuda":
-        optimizer_kwargs["fused"] = True
-    optimizer = torch.optim.AdamW(raw_model.parameters(), **optimizer_kwargs)
+    optimizer = build_optimizer(raw_model, device, config)
 
     sequence_length = int(config["sequence_length"])
     batch_size = int(config["micro_batch_size"])
@@ -164,8 +159,7 @@ def train(config: dict) -> dict:
                     if world_size > 1 and micro_step < accumulation_steps - 1
                     else nullcontext()
                 )
-                autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
-                with sync_context, autocast:
+                with sync_context, amp_context(device):
                     output = model(tokens, labels=tokens, return_logits=False)
                     loss = output.loss / accumulation_steps
                 if not torch.isfinite(loss):

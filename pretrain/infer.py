@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from contextlib import nullcontext
 
 import torch
 
@@ -12,6 +11,7 @@ from datasets.tokenizer import ensure_tokenizer
 
 from .checkpoint import load_training_checkpoint
 from .common import (
+    amp_context,
     build_model,
     choose_device,
     read_json,
@@ -206,10 +206,12 @@ def main():
     # --------------------------------------------------
     # 3. 创建和训练时完全相同的模型
     # --------------------------------------------------
+    # 与训练一致的参数精度：master_weights=false 时参数存 bf16
+    parameter_dtype = "bfloat16" if config.get("master_weights", True) is False else config.get("dtype", "bfloat16")
     model = build_model(
         config["model_config"],
         device,
-        config.get("dtype", "bfloat16"),
+        parameter_dtype,
     )
 
     # --------------------------------------------------
@@ -251,15 +253,7 @@ def main():
     # --------------------------------------------------
     # 7. inference
     # --------------------------------------------------
-    if device.type == "cuda":
-        autocast = torch.autocast(
-            "cuda",
-            dtype=torch.bfloat16,
-        )
-    else:
-        autocast = nullcontext()
-
-    with autocast:
+    with amp_context(device):
         answer = generate(
             model=model,
             tokenizer=tokenizer,

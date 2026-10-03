@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import argparse
 
-import torch
 from transformers import AutoTokenizer
 
-from .common import choose_device, load_model_from_checkpoint
+from .common import amp_context, choose_device, load_model_from_checkpoint
 
 
 def main() -> None:
@@ -23,21 +22,20 @@ def main() -> None:
 
     device = choose_device(0)
     model, _, checkpoint_dir = load_model_from_checkpoint(args.checkpoint, device)
-    if device.type == "cuda":
-        model = model.to(torch.bfloat16)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, local_files_only=True)
     input_ids = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-    output = model.generate(
-        input_ids,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        do_sample=not args.greedy,
-        seed=args.seed,
-        repetition_penalty=args.repetition_penalty,
-    )
+    with amp_context(device):
+        output = model.generate(
+            input_ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            do_sample=not args.greedy,
+            seed=args.seed,
+            repetition_penalty=args.repetition_penalty,
+        )
     print(tokenizer.decode(output[0], skip_special_tokens=True))
 
 

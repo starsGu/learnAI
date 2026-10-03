@@ -8,6 +8,7 @@
   "output_dir": "checkpoints/pretrain/qwen3-0.6B",
   "seed": 42,
   "dtype": "bfloat16",
+  "master_weights": false,
   "device": "cuda",
   "sequence_length": 2048,
   "micro_batch_size": 16,
@@ -28,6 +29,6 @@
   "log_every_steps": 1,
   "eval_every_steps": 50,
   "keep_recent_checkpoints": 1,
-  "keep_total_checkpoints": 4,
+  "keep_total_checkpoints": 3,
   "save_every_steps": 50
 }

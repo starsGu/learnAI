@@ -5,13 +5,12 @@ import csv
 import json
 import math
 import re
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 
 from datasets import PackedTokenCorpus
-from .common import choose_device, load_model_from_checkpoint, read_json, write_json
+from .common import amp_context, choose_device, load_model_from_checkpoint, read_json, write_json
 from .prompts import get_prompts
 from .train import VALIDATION_SEED
 
@@ -36,8 +35,7 @@ def corpus_loss(model, corpus: PackedTokenCorpus, batches: int, batch_size: int,
     model.eval()
     for index in range(batches):
         tokens = corpus.batch(index * batch_size, batch_size, 0, 1, VALIDATION_SEED, device)
-        autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
-        with autocast:
+        with amp_context(device):
             loss = model(tokens, labels=tokens, return_logits=False).loss
         token_count = batch_size * corpus.sequence_length
         total_loss += float(loss) * token_count
@@ -48,8 +46,6 @@ def corpus_loss(model, corpus: PackedTokenCorpus, batches: int, batch_size: int,
 def evaluate(checkpoint: str, config: dict) -> Path:
     device = choose_device(0)
     model, train_config, checkpoint_dir = load_model_from_checkpoint(checkpoint, device)
-    if device.type == "cuda":
-        model = model.to(torch.bfloat16)
     tokenizer = __import__("transformers").AutoTokenizer.from_pretrained(checkpoint_dir, local_files_only=True)
     manifest = config.get("data_manifest", train_config["data_manifest"])
     sequence_length = int(config.get("sequence_length", train_config["sequence_length"]))
@@ -67,16 +63,17 @@ def evaluate(checkpoint: str, config: dict) -> Path:
     max_new_tokens = int(config.get("max_new_tokens", 64))
     for item in prompts:
         encoded = tokenizer(item["prompt"], return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-        generated = model.generate(
-            encoded,
-            max_new_tokens=max_new_tokens,
-            temperature=float(config.get("temperature", 0.8)),
-            top_k=int(config.get("top_k", 40)),
-            top_p=float(config.get("top_p", 0.95)),
-            do_sample=bool(config.get("do_sample", True)),
-            seed=int(config.get("seed", 42)),
-            repetition_penalty=float(config.get("repetition_penalty", 1.0)),
-        )
+        with amp_context(device):
+            generated = model.generate(
+                encoded,
+                max_new_tokens=max_new_tokens,
+                temperature=float(config.get("temperature", 0.8)),
+                top_k=int(config.get("top_k", 40)),
+                top_p=float(config.get("top_p", 0.95)),
+                do_sample=bool(config.get("do_sample", True)),
+                seed=int(config.get("seed", 42)),
+                repetition_penalty=float(config.get("repetition_penalty", 1.0)),
+            )
         new_tokens = generated[0, encoded.shape[1] :]
         text = tokenizer.decode(new_tokens, skip_special_tokens=True)
         anomalies = generation_anomalies(text, len(new_tokens) >= max_new_tokens)
