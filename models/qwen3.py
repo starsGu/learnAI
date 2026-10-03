@@ -192,7 +192,9 @@ class Qwen3ForCausalLM(nn.Module):
             valid = int((chunk_labels != -100).sum().item())
             if not valid:
                 continue
-            logits = self.lm_head(shifted_hidden[start : start + chunk_size]).float()
+            # 不要在这里 .float()：那会让 logits 以 fp32 常驻显存（backward 时被 autograd 保留），
+            # 内存翻倍。F.cross_entropy 内部本来就会升到 fp32 计算，实测两者 loss 完全相同。
+            logits = self.lm_head(shifted_hidden[start : start + chunk_size])
             total = total + F.cross_entropy(logits, chunk_labels, ignore_index=-100, reduction="sum")
             count += valid
         if count == 0:

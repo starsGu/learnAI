@@ -200,3 +200,181 @@ class SelectiveMasterWeightTests(unittest.TestCase):
         }
         for name, delta in moved.items():
             self.assertGreater(delta, 0.0, f"{name} 完全没有更新（优化器漏了它）")
+
+
+class OomRetryTests(unittest.TestCase):
+    """OOM 时自动把 micro_batch 减半、梯度累积翻倍，保证全局 batch 不变。"""
+
+    def _run_main(self, base_micro: int, fail_times: int, retries: int = 2):
+        import json as _json
+        import sys as _sys
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+
+        import pretrain.train as train_module
+        from pretrain.common import write_json as _write_json
+
+        with _tempfile.TemporaryDirectory() as directory:
+            root = _Path(directory)
+            config_path = root / "train.json"
+            _write_json(
+                config_path,
+                {
+                    "dataset_name": "probe",
+                    "num_gpus": 1,
+                    "model_config": "unused.json",
+                    "data_manifest": "unused.json",
+                    "tokenizer_repo": "unused",
+                    "tokenizer_dir": "unused",
+                    "output_dir": str(root / "out"),
+                    "sequence_length": 2048,
+                    "micro_batch_size": base_micro,
+                    "global_tokens_per_step": 524288,
+                    "target_tokens": 524288,
+                },
+            )
+            attempts: list[tuple[int, int]] = []
+
+            def fake_train(config):
+                attempts.append((config["micro_batch_size"], config["accumulation_steps"]))
+                if len(attempts) <= fail_times:
+                    raise torch.cuda.OutOfMemoryError("simulated OOM")
+                return {"step": 1}
+
+            original_train = train_module.train
+            original_argv = _sys.argv
+            train_module.train = fake_train
+            _sys.argv = [
+                "train",
+                "--config", str(config_path),
+                "--data", str(root),
+                "--retry-on-oom", str(retries),
+            ]
+            try:
+                train_module.main()
+            finally:
+                train_module.train = original_train
+                _sys.argv = original_argv
+            return attempts
+
+    def test_halves_micro_batch_and_doubles_accumulation(self) -> None:
+        attempts = self._run_main(base_micro=16, fail_times=1, retries=2)
+        self.assertEqual(attempts, [(16, 16), (8, 32)])
+        # 每次重试后，micro_batch * 梯度累积 恒等于全局 batch 的 256 条序列
+        for micro, accumulation in attempts:
+            self.assertEqual(micro * accumulation, 256)
+
+    def test_no_retry_when_disabled(self) -> None:
+        with self.assertRaises(torch.cuda.OutOfMemoryError):
+            self._run_main(base_micro=16, fail_times=1, retries=0)
+
+    def test_gives_up_after_retry_budget(self) -> None:
+        with self.assertRaises(torch.cuda.OutOfMemoryError):
+            self._run_main(base_micro=16, fail_times=5, retries=1)
+
+
+class LossChunkSizeTests(unittest.TestCase):
+    """loss_chunk_size 只影响显存峰值：loss 值必须（在 f32 舍入内）不变。"""
+
+    def test_loss_is_invariant_to_chunk_size(self) -> None:
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(
+            Qwen3Config(
+                vocab_size=512, hidden_size=64, intermediate_size=128,
+                num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                head_dim=16, max_position_embeddings=64, bos_token_id=1, eos_token_id=2,
+            )
+        ).eval()
+        data = torch.randint(0, 512, (3, 65))
+        with torch.no_grad():
+            losses = {
+                chunk: float(model(data, labels=data, return_logits=False, loss_chunk_size=chunk).loss)
+                for chunk in (16, 64, 128, 1024)
+            }
+        values = list(losses.values())
+        reference = values[-1]
+        for chunk, value in losses.items():
+            # 累加顺序不同只带来 f32 舍入差（实测相对误差约 8e-8）
+            self.assertAlmostEqual(value, reference, delta=abs(reference) * 1e-6,
+                                   msg=f"chunk_size={chunk} 的 loss 偏离过大: {losses}")
+
+
+class MixedDtypeOptimizerTests(unittest.TestCase):
+    """回归：混合 dtype 的参数组不能在 fused 内核下生效。
+
+    GPU 上曾报：params, grads, exp_avgs, exp_avg_sqs must have same dtype。
+    根因是 fp32 主权重 + bf16 直更参数共处一个参数组，而 fused AdamW 要求整组同 dtype。
+    """
+
+    def _build(self):
+        import tempfile
+        from pathlib import Path
+        from pretrain.common import write_json as _write_json
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.json"
+            _write_json(path, tiny_config())
+            model = build_model(path, torch.device("cpu"), "bfloat16", low_precision=True)
+            optimizer = build_optimizer(model, torch.device("cpu"), {"learning_rate": 3e-4})
+            return model, optimizer
+
+    def test_fused_is_disabled_for_mixed_dtypes(self) -> None:
+        _, optimizer = self._build()
+        self.assertIsInstance(optimizer, MasterWeightOptimizer)
+        self.assertFalse(bool(optimizer.inner.defaults.get("fused")), "混合 dtype 时不能开 fused")
+
+    def test_param_group_really_mixes_dtypes(self) -> None:
+        _, optimizer = self._build()
+        dtypes = {p.dtype for group in optimizer.inner.param_groups for p in group["params"]}
+        self.assertIn(torch.float32, dtypes, "主权重应为 fp32")
+        self.assertIn(torch.bfloat16, dtypes, "直更参数应为 bf16")
+
+    def test_step_runs_and_updates_both_kinds(self) -> None:
+        model, optimizer = self._build()
+        norm0 = {n: p.detach().float().clone() for n, p in model.named_parameters() if "norm" in n}
+        lin0 = {n: p.detach().float().clone() for n, p in model.named_parameters() if "q_proj" in n}
+        torch.manual_seed(0)
+        data = torch.randint(0, tiny_config()["vocab_size"], (4, 65))
+        for _ in range(10):
+            optimizer.zero_grad(set_to_none=True)
+            with amp_context(torch.device("cpu")):
+                loss = model(data, labels=data, return_logits=False, loss_chunk_size=32).loss
+            loss.backward()
+            optimizer.step()  # 曾在此抛 dtype RuntimeError
+        norm_move = max(float((p.detach().float() - norm0[n]).abs().max()) for n, p in model.named_parameters() if n in norm0)
+        lin_move = max(float((p.detach().float() - lin0[n]).abs().max()) for n, p in model.named_parameters() if n in lin0)
+        self.assertGreater(norm_move, 1e-5, "归一化权重未更新")
+        self.assertGreater(lin_move, 1e-5, "Linear 权重未更新")
+
+    def test_optimizer_state_round_trip(self) -> None:
+        """checkpoint 续训依赖它：状态必须能存能读、且读后继续更新。"""
+        import tempfile
+        from pathlib import Path
+        import torch as _torch
+        from pretrain.checkpoint import save_checkpoint, load_training_checkpoint
+        from pretrain.common import write_json as _write_json
+        from pretrain.train import cosine_scheduler
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "model.json"
+            _write_json(path, tiny_config())
+            model = build_model(path, _torch.device("cpu"), "bfloat16", low_precision=True)
+            optimizer = build_optimizer(model, _torch.device("cpu"), {"learning_rate": 3e-4})
+            scheduler = cosine_scheduler(optimizer, 1, 10, 0.1)
+            state = {"step": 1, "tokens_seen": 3, "global_sequence_offset": 1, "best_validation_loss": None}
+            class _Tokenizer:
+                def save_pretrained(self, path):
+                    Path(path).mkdir(parents=True, exist_ok=True)
+                    (Path(path) / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+
+            saved = save_checkpoint(root, model, optimizer, scheduler, _Tokenizer(),
+                                    {"model_config": "unused"}, state, 0, 1)
+
+            restored_model = build_model(path, _torch.device("cpu"), "bfloat16", low_precision=True)
+            restored_optimizer = build_optimizer(restored_model, _torch.device("cpu"), {"learning_rate": 3e-4})
+            restored_scheduler = cosine_scheduler(restored_optimizer, 1, 10, 0.1)
+            restored_state = load_training_checkpoint(saved, restored_model, restored_optimizer,
+                                                      restored_scheduler, 0)
+            self.assertEqual(restored_state["step"], 1)
+            self.assertEqual(len(restored_optimizer.inner.state), len(optimizer.inner.state),
+                             "优化器状态数量应一致")

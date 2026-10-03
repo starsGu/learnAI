@@ -11,4 +11,6 @@ checkpoints/**/*.pth
 checkpoints/**/optimizer.pt
 checkpoints/**/scheduler.pt
 checkpoints/**/rng-rank-*.pt
-checkpoints/pretrain/
+llm-review.patch
+# 训练产物：权重、优化器状态一律不入库
+checkpoints/

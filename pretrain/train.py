@@ -48,16 +48,24 @@ VALIDATION_SEED = 12345
 
 @torch.no_grad()
 def evaluate_loss(model, corpus, config, device, rank, world_size) -> float:
+    """验证集 loss = 全部被评估 token 的加权平均。
+
+    micro batch 可以比训练更小：总 token 数 = batch_size × batches × world_size 不变，
+    所以 loss 结论与分几个 micro-batch 无关，但峰值显存按比例下降。启动时的初始验证
+    发生在第一次参数更新之前，是最容易 OOM 的一段，因此默认用更小的 micro batch。
+    """
     model.eval()
     losses = torch.zeros(2, device=device, dtype=torch.float64)
     batches = int(config["validation_batches"])
-    batch_size = int(config["micro_batch_size"])
+    batch_size = int(config.get("validation_micro_batch_size", min(int(config["micro_batch_size"]), 8)))
     sequence_length = int(config["sequence_length"])
+    loss_chunk_size = int(config.get("loss_chunk_size", 64))
     for index in range(batches):
         offset = index * batch_size * world_size
         tokens = corpus.batch(offset, batch_size, rank, world_size, VALIDATION_SEED, device)
         with amp_context(device):
-            output = model(tokens, labels=tokens, return_logits=False)
+            output = model(tokens, labels=tokens, return_logits=False,
+                           loss_chunk_size=loss_chunk_size)
         losses[0] += output.loss.double() * batch_size * sequence_length
         losses[1] += batch_size * sequence_length
     if world_size > 1:
@@ -68,6 +76,8 @@ def evaluate_loss(model, corpus, config, device, rank, world_size) -> float:
 
 def train(config: dict) -> dict:
     # 先确认设备：配置要求 CUDA 而不可用时立刻失败，避免静默降级到 CPU 烧时间
+    # 分块 loss 的块大小：只影响显存峰值，不影响 loss 值（仍是全 token 平均）
+    loss_chunk_size = int(config.get("loss_chunk_size", 64))
     device = resolve_device(config, int(os.environ.get("LOCAL_RANK", "0")))
     rank, local_rank, world_size = distributed_environment()
     configured_gpus = int(config.get("num_gpus", world_size))
@@ -80,9 +90,10 @@ def train(config: dict) -> dict:
     seed = int(config.get("seed", 42))
     seed_everything(seed + rank)
 
-    # master_weights=false：参数存 bf16 省显存，用 fp32 主权重副本保证更新精度
-    parameter_dtype = "bfloat16" if config.get("master_weights", True) is False else config.get("dtype", "bfloat16")
-    model = build_model(config["model_config"], device, parameter_dtype)
+    # master_weights=false：参数存 bf16 省显存，用 fp32 主权重副本保证归一化权重的更新精度
+    low_precision = config.get("master_weights", True) is False
+    model = build_model(config["model_config"], device, config.get("dtype", "bfloat16"),
+                        low_precision=low_precision)
     if config.get("gradient_checkpointing", True):
         model.set_gradient_checkpointing(True)
     raw_model = model
@@ -160,7 +171,8 @@ def train(config: dict) -> dict:
                     else nullcontext()
                 )
                 with sync_context, amp_context(device):
-                    output = model(tokens, labels=tokens, return_logits=False)
+                    output = model(tokens, labels=tokens, return_logits=False,
+                                   loss_chunk_size=loss_chunk_size)
                     loss = output.loss / accumulation_steps
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite loss at step {state['step']}")
@@ -239,11 +251,69 @@ def main() -> None:
         help="Root containing processed training data and tokenizer files (default: D:/datasets/llm)",
     )
     parser.add_argument("--resume-from", help="Checkpoint directory or a latest pointer")
+    parser.add_argument(
+        "--retry-on-oom",
+        type=int,
+        default=1,
+        help="OOM 时自动把 micro_batch 减半、梯度累积翻倍（全局 batch 不变）并续训的次数；0 = 关闭",
+    )
+    parser.add_argument(
+        "--no-retry-on-oom",
+        action="store_true",
+        help="OOM 时直接失败（等价于 --retry-on-oom 0）",
+    )
     args = parser.parse_args()
-    config = configure_train_paths(read_json(args.config), args.data)
-    if args.resume_from:
-        config["resume_from"] = args.resume_from
-    state = train(config)
+    base_config = configure_train_paths(read_json(args.config), args.data)
+    resume_pointer = args.resume_from
+
+    retries = 0 if args.no_retry_on_oom else max(0, int(args.retry_on_oom))
+    attempt = 0
+    while True:
+        config = dict(base_config)
+        micro = max(1, int(base_config["micro_batch_size"]) // (2**attempt))  # 每次重试减半
+        config["micro_batch_size"] = micro
+        config["accumulation_steps"] = int(base_config["global_tokens_per_step"]) // (
+            int(base_config["sequence_length"]) * micro * int(base_config.get("num_gpus", 1))
+        )
+        # 保持整除：减半后若无法整除 global_tokens_per_step，就继续减半
+        while micro > 1 and int(base_config["global_tokens_per_step"]) % (
+            int(base_config["sequence_length"]) * micro * int(base_config.get("num_gpus", 1))
+        ):
+            micro //= 2
+            config["micro_batch_size"] = micro
+            config["accumulation_steps"] = int(base_config["global_tokens_per_step"]) // (
+                int(base_config["sequence_length"]) * micro * int(base_config.get("num_gpus", 1))
+            )
+        if resume_pointer:
+            config["resume_from"] = resume_pointer
+        if attempt:
+            print(
+                f"[OOM 重试 {attempt}/{retries}] micro_batch_size={micro} "
+                f"梯度累积={config['accumulation_steps']}（每步仍是 "
+                f"{base_config['global_tokens_per_step']} tokens，训练语义不变）",
+                flush=True,
+            )
+        try:
+            state = train(config)
+        except torch.cuda.OutOfMemoryError as error:
+            if attempt >= retries:
+                print(
+                    f"[OOM] 已重试 {attempt} 次仍失败。当前 micro_batch_size={micro}。"
+                    "建议：跑 python scripts/diagnose_memory.py --sweep 找安全上限，"
+                    "或在配置里显式降低 micro_batch_size / sequence_length",
+                    flush=True,
+                )
+                raise
+            attempt += 1
+            import gc
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if not resume_pointer:
+                resume_pointer = str(Path(config["output_dir"]) / "latest")
+            continue
+        break
     print(json.dumps(state, ensure_ascii=False))
 
 

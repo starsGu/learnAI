@@ -116,22 +116,24 @@ def unwrap_model(model: torch.nn.Module) -> Qwen3ForCausalLM:
     return model.module if hasattr(model, "module") else model  # type: ignore[return-value]
 
 
-def build_model(model_config_path: str | Path, device: torch.device, dtype_name: str) -> Qwen3ForCausalLM:
-    """构建模型：默认参数保持 fp32（master weights），bf16 只用于 autocast 前向。
+def build_model(model_config_path: str | Path, device: torch.device,
+                dtype_name: str, low_precision: bool = False) -> Qwen3ForCausalLM:
+    """构建模型。
 
-    为什么不能用 model.to(bfloat16) 直接转参数：那样 AdamW 的参数更新在 bf16 里进行，
-    而 bf16 在 1.0 附近分辨率约 3e-5，学习率量级的更新（~3e-4）会被舍入掉，
-    RMSNorm 这类初始值为 1.0 的参数会永久冻结（实测 65536/65536 个元素零更新）。
-
-    若配置里设置 `master_weights: false`，模型转 bf16 省显存，改用 fp32 主权重副本
-    （见 MasterWeightOptimizer）来保证更新精度——显存与"全 fp32 参数"方案相当，
-    但参数与梯度仍是 bf16。
+    - 默认（low_precision=False）：参数保持 fp32（master weights），bf16 只用于
+      autocast 前向。理由：model.to(bfloat16) 会让 AdamW 的更新在 bf16 里进行，
+      而 bf16 在 1.0 附近分辨率约 3e-5，学习率量级的更新（~3e-4）会被舍入掉，
+      RMSNorm 这类初始值为 1.0 的参数会永久冻结（实测 65536/65536 元素零更新）。
+    - low_precision=True（配置 master_weights=false）：参数与梯度存 bf16 以省显存
+      （参数 1.11 + 梯度 1.11 + AdamW 2.22 ≈ 4.44 GiB，fp32 方案是 8.88 GiB），
+      归一化权重的更新精度由 MasterWeightOptimizer 的 fp32 主权重保证。
     """
+    del dtype_name  # 保留签名兼容；精度由 low_precision 决定
     config = Qwen3Config.from_json(model_config_path)
     model = Qwen3ForCausalLM(config)
-    if dtype_name == "bfloat16":
-        return model.to(device=device, dtype=torch.float32)
-    return model.to(device=device)
+    if low_precision:
+        return model.to(device=device, dtype=torch.bfloat16)
+    return model.to(device=device, dtype=torch.float32)
 
 
 def amp_context(device: torch.device):
@@ -162,23 +164,19 @@ def needs_master_weight(name: str) -> bool:
     return "norm" in name and name.endswith(".weight")
 
 
-class MasterWeightOptimizer:
+class MasterWeightOptimizer(torch.optim.Optimizer):
     """低精度参数 + fp32 主权重副本：给必须精确更新的参数保留 fp32 更新精度。
 
     直接让 AdamW 更新 bf16 参数时，1.0 附近的微小更新会被舍入掉（RMSNorm 永久冻结）。
-    这里对选中的参数额外维护一份 fp32 主权重：梯度从 bf16 参数搬过来、AdamW 在 fp32
-    上更新、再写回 bf16 参数；未选中的参数仍由 AdamW 直接更新（省显存）。
+    这里对选中的参数额外维护一份 fp32 主权重：梯度从 bf16 参数搬过来、优化器在 fp32
+    上更新、再写回 bf16 参数；未选中的参数仍直接更新（省显存）。
 
-    用法：
-        optimizer = build_optimizer(model, device, config)
-        loss.backward()
-        optimizer.step()      # 内部自动同步梯度 -> 更新主权重 -> 回写参数
-        optimizer.zero_grad()
+    必须继承 torch.optim.Optimizer：torch.optim.lr_scheduler.LambdaLR 会做
+    isinstance(optimizer, Optimizer) 检查，包装类不继承会在构造调度器时抛 TypeError。
     """
 
-    def __init__(self, model: torch.nn.Module, inner: torch.optim.Optimizer | None = None,
+    def __init__(self, model: torch.nn.Module, device: torch.device, config: dict,
                  selector=needs_master_weight) -> None:
-        self.inner = inner
         self.masters: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
         self.parameters: list[torch.nn.Parameter] = []
         seen: set[int] = set()
@@ -191,12 +189,26 @@ class MasterWeightOptimizer:
                 master = parameter.detach().to(torch.float32).clone().requires_grad_(True)
                 self.masters.append((parameter, master))
 
+        # 关键参数的更新交给 fp32 主权重；其余参数直接更新
+        selected = {id(parameter) for parameter, _ in self.masters}
+        direct = [p for p in self.parameters if id(p) not in selected]
+        grouped = [master for _, master in self.masters] + direct
+        kwargs = {
+            "lr": float(config["learning_rate"]),
+            "betas": tuple(config.get("betas", [0.9, 0.95])),
+            "eps": float(config.get("adam_epsilon", 1e-8)),
+            "weight_decay": float(config.get("weight_decay", 0.1)),
+        }
+        # fused AdamW 要求整个参数组 dtype 一致，而这里必然混用
+        # （fp32 主权重 + bf16 直接更新参数），因此不能开 fused。
+        self.inner = torch.optim.AdamW(grouped, **kwargs)
+        # 基类拿到同一批参数与超参：这样 LR 调度器等工具看到的就是真实的参数组
+        super().__init__(grouped, kwargs)
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         # 未配主权重的参数不在 inner 里，必须自己清，否则梯度会跨 step 累积
         for parameter in self.parameters:
             parameter.grad = None
-        for _, master in self.masters:
-            master.grad = None
         self.inner.zero_grad(set_to_none=set_to_none)
 
     def step(self, closure=None):
@@ -212,49 +224,38 @@ class MasterWeightOptimizer:
         for parameter in self.parameters:
             parameter.grad = None
         for _, master in self.masters:
-            master.grad = None
+            master.grad = None   # 不清会在下一个 step 里把本次梯度再累加一次
         return result
 
-    def state_dict(self) -> dict:
-        return {"inner": self.inner.state_dict()}
+    # 注意：不要覆写 self.state / self.param_groups —— 基类 __init__ 会给它们赋值，
+    # 定义成只读 property 会在构造时抛 "property has no setter"。
+    # 模型参数组已交给基类，因此调度器读到的 LR 就是真实 LR；
+    # AdamW 的动量等状态由下面的方法单独存取，供 checkpoint 保存。
+    def optimizer_state_dict(self) -> dict:
+        return self.inner.state_dict()
 
-    def load_state_dict(self, state: dict) -> None:
-        self.inner.load_state_dict(state["inner"])
+    def load_optimizer_state_dict(self, state: dict) -> None:
+        # 兼容旧 checkpoint：此前存的是 {"inner": ...}
+        self.inner.load_state_dict(state.get("inner", state))
 
 
 def build_optimizer(model: torch.nn.Module, device: torch.device, config: dict):
-    """构建优化器；参数是低精度时为关键参数（归一化权重）改用 fp32 主权重。
+    """构建优化器；参数是低精度时为关键参数（归一化权重）改走 fp32 主权重。
 
-    注意两点（早期实现都踩过）：
-    1. 关键参数的 AdamW 必须建在**主权重**上，建在 bf16 参数上更新会被舍入掉；
-    2. 未被选中的参数（Linear/Embedding）仍要交给 AdamW 直接更新，不能漏掉。
+    参数全为 fp32 时直接用 AdamW；否则返回 MasterWeightOptimizer（它本身是
+    torch.optim.Optimizer 的子类，可被 LambdaLR 等工具正常使用）。
     """
-    kwargs = {
-        "lr": float(config["learning_rate"]),
-        "betas": tuple(config.get("betas", [0.9, 0.95])),
-        "eps": float(config.get("adam_epsilon", 1e-8)),
-        "weight_decay": float(config.get("weight_decay", 0.1)),
-    }
-    if device.type == "cuda":
-        kwargs["fused"] = True
-    needs_master = any(parameter.dtype != torch.float32 for parameter in model.parameters())
-    if not needs_master:
+    if all(parameter.dtype == torch.float32 for parameter in model.parameters()):
+        kwargs = {
+            "lr": float(config["learning_rate"]),
+            "betas": tuple(config.get("betas", [0.9, 0.95])),
+            "eps": float(config.get("adam_epsilon", 1e-8)),
+            "weight_decay": float(config.get("weight_decay", 0.1)),
+        }
+        if device.type == "cuda":
+            kwargs["fused"] = True
         return torch.optim.AdamW(model.parameters(), **kwargs)
-
-    wrapper = MasterWeightOptimizer(model)
-    master_ids = {id(master) for _, master in wrapper.masters}
-    selected = {id(parameter) for parameter, _ in wrapper.masters}
-    direct: list[torch.nn.Parameter] = []
-    seen: set[int] = set()
-    for parameter in model.parameters():
-        if id(parameter) in seen or id(parameter) in selected:
-            continue
-        seen.add(id(parameter))
-        direct.append(parameter)
-    grouped = [master for _, master in wrapper.masters] + direct
-    assert not (master_ids & {id(p) for p in direct})
-    wrapper.inner = torch.optim.AdamW(grouped, **kwargs)
-    return wrapper
+    return MasterWeightOptimizer(model, device, config)
 
 
 def resolve_checkpoint(path: str | Path) -> Path:

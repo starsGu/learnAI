@@ -128,7 +128,12 @@ def save_checkpoint(
         temporary.mkdir(parents=True, exist_ok=True)
         raw_model = unwrap_model(model)
         save_model(raw_model, temporary / "model.safetensors")
-        torch.save(optimizer.state_dict(), temporary / "optimizer.pt")
+        # MasterWeightOptimizer 真实状态在内部优化器里，优先用它自己的存取方法
+        saved_state = (
+            optimizer.optimizer_state_dict()
+            if hasattr(optimizer, "optimizer_state_dict") else optimizer.state_dict()
+        )
+        torch.save(saved_state, temporary / "optimizer.pt")
         torch.save(scheduler.state_dict(), temporary / "scheduler.pt")
         write_json(temporary / "config.json", raw_model.config.to_dict())
         write_json(temporary / "train_config.json", train_config)
@@ -170,7 +175,11 @@ def load_training_checkpoint(
         )
     load_model(model, checkpoint_dir / "model.safetensors", strict=True)
     model.tie_weights()
-    optimizer.load_state_dict(torch.load(checkpoint_dir / "optimizer.pt", map_location="cpu", weights_only=False))
+    saved_optimizer = torch.load(checkpoint_dir / "optimizer.pt", map_location="cpu", weights_only=False)
+    if hasattr(optimizer, "load_optimizer_state_dict"):
+        optimizer.load_optimizer_state_dict(saved_optimizer)   # 兼容旧格式
+    else:
+        optimizer.load_state_dict(saved_optimizer)
     scheduler.load_state_dict(torch.load(checkpoint_dir / "scheduler.pt", map_location="cpu", weights_only=False))
     # 单卡 checkpoint 只有 rng-rank-00000.pt；1 卡暂停改多卡续训时，
     # 新增 rank 回退到 rank0 的随机状态（数据顺序与 world size 无关，故不影响等价性）。
