@@ -150,32 +150,51 @@ def parameter_dtypes(model: torch.nn.Module) -> dict[str, int]:
     return counts
 
 
-class MasterWeightOptimizer:
-    """低精度参数 + fp32 主权重副本：省显存，同时保证小更新不被舍入掉。
+def needs_master_weight(name: str) -> bool:
+    """哪些参数必须用 fp32 主权重更新。
 
-    适用场景：参数存 bf16（省 2.22 GiB），但直接让 AdamW 更新 bf16 参数会把
-    1.0 附近的微小更新舍入掉（RMSNorm 永久冻结）。这里为每个参数维护一份 fp32
-    主权重：梯度从 bf16 参数搬过来、AdamW 在 fp32 上更新、再写回 bf16 参数。
+    只挑初始值为 1.0 的归一化权重：bf16 在 1.0 附近分辨率约 3e-5，学习率量级
+    的更新（~3e-4）会被舍入掉，实测这些参数会永久冻结。其余参数（Linear/Embedding）
+    初始化 std=0.02，更新量相对自身量级足够大，bf16 存储不会丢更新。
+
+    只为 65,536 个元素（占 0.011%）配主权重，开销约 0.25 MiB，而不是全量 2.22 GiB。
+    """
+    return "norm" in name and name.endswith(".weight")
+
+
+class MasterWeightOptimizer:
+    """低精度参数 + fp32 主权重副本：给必须精确更新的参数保留 fp32 更新精度。
+
+    直接让 AdamW 更新 bf16 参数时，1.0 附近的微小更新会被舍入掉（RMSNorm 永久冻结）。
+    这里对选中的参数额外维护一份 fp32 主权重：梯度从 bf16 参数搬过来、AdamW 在 fp32
+    上更新、再写回 bf16 参数；未选中的参数仍由 AdamW 直接更新（省显存）。
 
     用法：
-        optimizer = MasterWeightOptimizer(model, AdamW(model.parameters(), **kwargs))
+        optimizer = build_optimizer(model, device, config)
         loss.backward()
         optimizer.step()      # 内部自动同步梯度 -> 更新主权重 -> 回写参数
-        optimizer.zero_grad() # 内部清空主权重梯度
+        optimizer.zero_grad()
     """
 
-    def __init__(self, model: torch.nn.Module, inner: torch.optim.Optimizer | None = None) -> None:
+    def __init__(self, model: torch.nn.Module, inner: torch.optim.Optimizer | None = None,
+                 selector=needs_master_weight) -> None:
         self.inner = inner
         self.masters: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+        self.parameters: list[torch.nn.Parameter] = []
         seen: set[int] = set()
-        for parameter in model.parameters():
+        for name, parameter in model.named_parameters():
             if id(parameter) in seen:  # tied weights 会出现两次
                 continue
             seen.add(id(parameter))
-            master = parameter.detach().to(torch.float32).clone().requires_grad_(True)
-            self.masters.append((parameter, master))
+            self.parameters.append(parameter)
+            if selector(name):
+                master = parameter.detach().to(torch.float32).clone().requires_grad_(True)
+                self.masters.append((parameter, master))
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        # 未配主权重的参数不在 inner 里，必须自己清，否则梯度会跨 step 累积
+        for parameter in self.parameters:
+            parameter.grad = None
         for _, master in self.masters:
             master.grad = None
         self.inner.zero_grad(set_to_none=set_to_none)
@@ -190,8 +209,10 @@ class MasterWeightOptimizer:
         with torch.no_grad():
             for parameter, master in self.masters:
                 parameter.copy_(master)  # fp32 主权重 -> bf16 参数
-                parameter.grad = None
-                master.grad = None
+        for parameter in self.parameters:
+            parameter.grad = None
+        for _, master in self.masters:
+            master.grad = None
         return result
 
     def state_dict(self) -> dict:
@@ -202,10 +223,11 @@ class MasterWeightOptimizer:
 
 
 def build_optimizer(model: torch.nn.Module, device: torch.device, config: dict):
-    """按配置构建优化器；参数是低精度时自动改用 fp32 主权重。
+    """构建优化器；参数是低精度时为关键参数（归一化权重）改用 fp32 主权重。
 
-    注意：AdamW 必须建在**主权重**上。如果建在 bf16 模型参数上，更新会被舍入掉，
-    主权重就成了摆设（早期实现踩过这个坑）。
+    注意两点（早期实现都踩过）：
+    1. 关键参数的 AdamW 必须建在**主权重**上，建在 bf16 参数上更新会被舍入掉；
+    2. 未被选中的参数（Linear/Embedding）仍要交给 AdamW 直接更新，不能漏掉。
     """
     kwargs = {
         "lr": float(config["learning_rate"]),
@@ -218,9 +240,20 @@ def build_optimizer(model: torch.nn.Module, device: torch.device, config: dict):
     needs_master = any(parameter.dtype != torch.float32 for parameter in model.parameters())
     if not needs_master:
         return torch.optim.AdamW(model.parameters(), **kwargs)
+
     wrapper = MasterWeightOptimizer(model)
-    # 优化器只持有 fp32 主权重：更新精度不再受 bf16 舍入影响
-    wrapper.inner = torch.optim.AdamW([master for _, master in wrapper.masters], **kwargs)
+    master_ids = {id(master) for _, master in wrapper.masters}
+    selected = {id(parameter) for parameter, _ in wrapper.masters}
+    direct: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for parameter in model.parameters():
+        if id(parameter) in seen or id(parameter) in selected:
+            continue
+        seen.add(id(parameter))
+        direct.append(parameter)
+    grouped = [master for _, master in wrapper.masters] + direct
+    assert not (master_ids & {id(p) for p in direct})
+    wrapper.inner = torch.optim.AdamW(grouped, **kwargs)
     return wrapper
 
 

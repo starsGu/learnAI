@@ -156,3 +156,47 @@ class LowPrecisionMasterWeightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelectiveMasterWeightTests(unittest.TestCase):
+    """只给归一化权重配 fp32 主权重：显存开销 0.25 MiB，且其余参数照常更新。"""
+
+    def test_only_norm_weights_get_masters(self) -> None:
+        torch.manual_seed(42)
+        model = Qwen3ForCausalLM(Qwen3Config(**tiny_config())).to(torch.bfloat16)
+        optimizer = build_optimizer(model, torch.device("cpu"), {"learning_rate": 3e-4})
+        self.assertIsInstance(optimizer, MasterWeightOptimizer)
+        # 注意：named_parameters() 每次返回新的 Parameter 包装对象，必须按 id 比对
+        ids = {id(parameter) for parameter, _ in optimizer.masters}
+        master_names = {name for name, p in model.named_parameters() if id(p) in ids}
+        # 主权重只覆盖 norm.weight
+        self.assertTrue(master_names)
+        self.assertTrue(all("norm" in n for n in master_names), master_names)
+        # 显存开销：主权重元素数应远小于参数量
+        master_elements = sum(m.numel() for _, m in optimizer.masters)
+        self.assertLess(master_elements, model.num_parameters() * 0.01)
+
+    def test_non_norm_parameters_still_update(self) -> None:
+        """漏掉 Linear/Embedding 就会让它们完全不训练——必须验证。"""
+        torch.manual_seed(42)
+        model = Qwen3ForCausalLM(Qwen3Config(**tiny_config())).to(torch.bfloat16)
+        optimizer = build_optimizer(model, torch.device("cpu"), {"learning_rate": 3e-3})
+        before = {
+            n: p.detach().float().clone()
+            for n, p in model.named_parameters()
+            if "q_proj" in n or "embed_tokens" in n
+        }
+        torch.manual_seed(0)
+        data = torch.randint(0, tiny_config()["vocab_size"], (4, 65))
+        for _ in range(20):
+            optimizer.zero_grad(set_to_none=True)
+            with amp_context(torch.device("cpu")):
+                loss = model(data, labels=data, return_logits=False).loss
+            loss.backward()
+            optimizer.step()
+        moved = {
+            n: float((p.detach().float() - before[n]).abs().max())
+            for n, p in model.named_parameters() if n in before
+        }
+        for name, delta in moved.items():
+            self.assertGreater(delta, 0.0, f"{name} 完全没有更新（优化器漏了它）")
