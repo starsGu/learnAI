@@ -1,0 +1,31 @@
+{
+  "dataset_name": "smoke",
+  "model_config": "configs/smoke/model.json",
+  "data_manifest": "data/processed/smoke/manifest.json",
+  "tokenizer_repo": "Qwen/Qwen3-0.6B-Base",
+  "tokenizer_dir": "data/tokenizer/qwen3",
+  "output_dir": "checkpoints/pretrain/qwen3-tiny",
+  "resume_from": "checkpoints/pretrain/qwen3-tiny/latest",
+  "seed": 42,
+  "dtype": "bfloat16",
+  "device": "cpu",
+  "sequence_length": 16,
+  "micro_batch_size": 1,
+  "global_tokens_per_step": 32,
+  "target_tokens": 1280,
+  "learning_rate": 0.001,
+  "minimum_learning_rate_ratio": 0.1,
+  "warmup_ratio": 0.05,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "adam_epsilon": 1e-08,
+  "weight_decay": 0.1,
+  "gradient_clip": 1.0,
+  "gradient_checkpointing": false,
+  "validation_batches": 2,
+  "log_every_steps": 1,
+  "eval_every_steps": 8,
+  "save_every_steps": 8
+}

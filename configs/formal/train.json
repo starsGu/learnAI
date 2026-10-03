@@ -1,0 +1,33 @@
+{
+  "dataset_name": "chinese-10b",
+  "num_gpus": 2,
+  "model_config": "configs/formal/model.json",
+  "data_manifest": "data/processed/chinese-10b/manifest.json",
+  "tokenizer_repo": "Qwen/Qwen3-0.6B-Base",
+  "tokenizer_dir": "data/tokenizer/qwen3",
+  "output_dir": "checkpoints/pretrain/qwen3-0.6B",
+  "seed": 42,
+  "dtype": "bfloat16",
+  "device": "cuda",
+  "sequence_length": 2048,
+  "micro_batch_size": 16,
+  "global_tokens_per_step": 524288,
+  "target_tokens": 10000000000,
+  "learning_rate": 0.0003,
+  "minimum_learning_rate_ratio": 0.1,
+  "warmup_ratio": 0.01,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "adam_epsilon": 1e-08,
+  "weight_decay": 0.1,
+  "gradient_clip": 1.0,
+  "gradient_checkpointing": true,
+  "validation_batches": 20,
+  "log_every_steps": 1,
+  "eval_every_steps": 50,
+  "keep_recent_checkpoints": 1,
+  "keep_total_checkpoints": 4,
+  "save_every_steps": 50
+}

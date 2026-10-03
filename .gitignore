@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+data/raw/
+data/tokenizer/
+data/processed/
+checkpoints/**/*.safetensors
+checkpoints/**/*.pt
+checkpoints/**/*.pth
+checkpoints/**/optimizer.pt
+checkpoints/**/scheduler.pt
+checkpoints/**/rng-rank-*.pt
+checkpoints/pretrain/

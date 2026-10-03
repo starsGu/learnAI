@@ -1,0 +1,43 @@
+{
+  "dataset_name": "chinese-10b",
+  "tokenizer_repo": "Qwen/Qwen3-0.6B-Base",
+  "tokenizer_dir": "data/tokenizer/qwen3",
+  "document_separator_token_id": 151643,
+  "raw_dir": "data/raw",
+  "output_dir": "data/processed/chinese-10b",
+  "target_train_tokens": 10000000000,
+  "target_validation_tokens": 10000000,
+  "target_test_tokens": 10000000,
+  "validation_basis_points": 10,
+  "test_basis_points": 10,
+  "shard_tokens": 100000000,
+  "min_chars": 80,
+  "min_paragraph_chars": 24,
+  "min_chinese_ratio": 0.2,
+  "sources": [
+    {
+      "name": "fineweb-edu-zh",
+      "type": "huggingface",
+      "repo_id": "opencsg/Fineweb-Edu-Chinese-V2.1",
+      "allow_patterns": ["4_5/*.parquet"],
+      "text_field": "text",
+      "target_tokens": 5500000000
+    },
+    {
+      "name": "chinese-cosmopedia",
+      "type": "huggingface",
+      "repo_id": "opencsg/chinese-cosmopedia",
+      "allow_patterns": ["data/*.parquet"],
+      "text_field": "text",
+      "target_tokens": 2500000000
+    },
+    {
+      "name": "cci3-hq",
+      "type": "huggingface",
+      "repo_id": "BAAI/CCI3-HQ",
+      "allow_patterns": ["data/part_*"],
+      "text_field": "text",
+      "target_tokens": 2000000000
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# PyTorch and CUDA are supplied by the existing Conda environment.
+# Keep them out of this file so pip cannot replace the GPU build.
+transformers>=4.51
+safetensors>=0.5
+huggingface-hub>=0.30
+pyarrow>=19
+numpy>=1.26
+tqdm>=4.66

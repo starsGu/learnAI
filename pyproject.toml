@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-zh-pretrain"
+version = "0.1.0"
+description = "A compact, from-scratch Qwen3 Chinese pretraining pipeline"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.7",
+  "transformers>=4.51",
+  "safetensors>=0.5",
+  "huggingface-hub>=0.30",
+  "pyarrow>=19",
+  "numpy>=2.0",
+  "tqdm>=4.67",
+]
+
+[tool.setuptools]
+packages = ["models", "datasets", "pretrain"]

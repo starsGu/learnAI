@@ -1,0 +1,12 @@
+{
+  "loss_batches": 20,
+  "batch_size": 1,
+  "prompt_split": "dev",
+  "max_new_tokens": 64,
+  "temperature": 0.8,
+  "top_k": 40,
+  "top_p": 0.95,
+  "repetition_penalty": 1.2,
+  "do_sample": true,
+  "seed": 42
+}

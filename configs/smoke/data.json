@@ -1,0 +1,21 @@
+{
+  "dataset_name": "smoke",
+  "tokenizer_repo": "Qwen/Qwen3-0.6B-Base",
+  "tokenizer_dir": "data/tokenizer/qwen3",
+  "document_separator_token_id": 151643,
+  "raw_dir": "data/raw",
+  "output_dir": "data/processed/smoke",
+  "target_train_tokens": 100000,
+  "target_validation_tokens": 10000,
+  "target_test_tokens": 10000,
+  "validation_basis_points": 2000,
+  "test_basis_points": 2000,
+  "shard_tokens": 5000,
+  "min_chars": 20,
+  "min_paragraph_chars": 10,
+  "min_chinese_ratio": 0.2,
+  "sources": [
+    {"name": "smoke-a", "type": "local", "path": "data/smoke/source_a.jsonl", "text_field": "text", "target_tokens": 50000},
+    {"name": "smoke-b", "type": "local", "path": "data/smoke/source_b.jsonl", "text_field": "text", "target_tokens": 50000}
+  ]
+}
